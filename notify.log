@@ -1,0 +1,13 @@
+2025-03-18 12:24:17 - 支付平台返回参数：Array
+(
+    [pid] => 1031
+    [trade_no] => 2025031810451297914
+    [out_trade_no] => 67d8de37c7a53
+    [type] => alipay
+    [name] => product
+    [money] => 6.6
+    [trade_status] => TRADE_SUCCESS
+    [sign] => 17be0eecb5c5dd90c797784fa2c1d609
+    [sign_type] => MD5
+)
+
