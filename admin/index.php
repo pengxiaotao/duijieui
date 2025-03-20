@@ -1,106 +1,182 @@
 <?php
 session_start();
 require_once '../includes/db.php';
-require_once '../includes/functions.php';
+require_once '../includes/config.php';
 
-// 检查用户是否已登录
-$is_logged_in = isset($_SESSION['user_id']);
+// 开启错误报告
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
 
-if ($is_logged_in) {
-    // 获取用户信息
-    $user_id = $_SESSION['user_id'];
-    $stmt = $conn->prepare("SELECT username, balance, invite_code, email FROM users WHERE id = ?");
-    if (!$stmt) {
-        die("查询准备失败: " . $conn->error);
-    }
-    $stmt->bind_param("i", $user_id);
-    $stmt->execute();
-    $result = $stmt->get_result();
-    $user = $result->fetch_assoc();
-    
-    // 检查用户是否存在
-    if (!$user) {
-        // 用户不存在，清除session并重定向到登录页
-        session_destroy();
-        header("Location: login.php");
-        exit;
-    }
-    
-    $username = $user['username'] ?? '';
-    $balance = $user['balance'] ?? 0;
-    $invite_code = $user['invite_code'] ?? '';
-    $email = $user['email'] ?? '';
-
-    // 获取推广统计信息
-    $stmt = $conn->prepare("SELECT COUNT(*) as total_invites FROM users WHERE invited_by = ?");
-    if (!$stmt) {
-        die("查询准备失败: " . $conn->error);
-    }
-    $stmt->bind_param("i", $user_id);
-    $stmt->execute();
-    $invite_stats = $stmt->get_result()->fetch_assoc();
-    $total_invites = $invite_stats['total_invites'] ?? 0;
-
-    // 获取邀请的用户列表
-    $stmt = $conn->prepare("
-        SELECT u.id, u.username, u.created_at,
-        COALESCE(SUM(r.amount), 0) as total_recharge
-        FROM users u
-        LEFT JOIN recharge_logs r ON u.id = r.user_id AND r.is_paid = 1
-        WHERE u.invited_by = ?
-        GROUP BY u.id
-        ORDER BY u.created_at DESC
-        LIMIT 10
-    ");
-    if (!$stmt) {
-        die("查询准备失败: " . $conn->error);
-    }
-    $stmt->bind_param("i", $user_id);
-    $stmt->execute();
-    $invited_users = $stmt->get_result()->fetch_all(MYSQLI_ASSOC) ?? [];
-
-    // 获取分站信息
-    $stmt = $conn->prepare("SELECT * FROM sub_sites WHERE user_id = ?");
-    if (!$stmt) {
-        die("查询准备失败: " . $conn->error);
-    }
-    $stmt->bind_param("i", $user_id);
-    $stmt->execute();
-    $sub_site = $stmt->get_result()->fetch_assoc();
-
-    // 获取最近的上传记录
-    $stmt = $conn->prepare("SELECT * FROM uploaded_images WHERE user_id = ? ORDER BY created_at DESC LIMIT 5");
-    if (!$stmt) {
-        die("查询准备失败: " . $conn->error);
-    }
-    $stmt->bind_param("i", $user_id);
-    $stmt->execute();
-    $recent_uploads = $stmt->get_result()->fetch_all(MYSQLI_ASSOC) ?? [];
-
-    // 获取最近的充值记录
-    $stmt = $conn->prepare("SELECT * FROM recharge_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT 5");
-    if (!$stmt) {
-        die("查询准备失败: " . $conn->error);
-    }
-    $stmt->bind_param("i", $user_id);
-    $stmt->execute();
-    $recent_recharges = $stmt->get_result()->fetch_all(MYSQLI_ASSOC) ?? [];
-
-    // 生成推广链接
-    $promote_url = $config['site_url'] . "/public/register.php?invite_code=" . $invite_code;
+// 检查管理员是否已登录
+if (!isset($_SESSION['admin_id'])) {
+    header('Location: login.php');
+    exit;
 }
-?>
-<!DOCTYPE html>
-<html>
 
+// 检查数据库连接
+if ($conn->connect_error) {
+    die("数据库连接失败: " . $conn->connect_error);
+}
+
+// 检查必要的表是否存在
+$required_tables = ['users', 'uploaded_images', 'recharge_logs', 'comfyui_servers', 'comfyui_usage_logs', 'comfyui_statistics', 'admins'];
+foreach ($required_tables as $table) {
+    $result = $conn->query("SHOW TABLES LIKE '$table'");
+    if ($result->num_rows == 0) {
+        die("错误：数据表 '$table' 不存在，请先执行 sql/tables.sql 创建必要的表");
+    }
+}
+
+// 查询推广比例
+$stmt = $conn->prepare("SELECT promotion_ratio FROM settings");
+$stmt->execute();
+$result = $stmt->get_result();
+$promotion_ratio = $result->fetch_row()[0] ?? 0;
+
+// 处理管理员设置每次扣费金额的表单提交
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (isset($_POST['upload_fee'])) {
+        $upload_fee = floatval($_POST['upload_fee']);
+        // 将新的扣费金额保存到配置文件中
+        $config_file = '../includes/config.php';
+        $config_content = file_get_contents($config_file);
+
+        // 查找并替换 UPLOAD_FEE 的定义
+        $pattern = "/define\('UPLOAD_FEE', [\d\.]+(\);)/";
+        if (preg_match($pattern, $config_content, $matches)) {
+            $old_define = $matches[0];
+            $new_define = "define('UPLOAD_FEE', $upload_fee);";
+            $config_content = str_replace($old_define, $new_define, $config_content);
+            file_put_contents($config_file, $config_content);
+        }
+    }
+    header('Location: index.php');
+    exit;
+}
+
+// 统计充值成功总计金额
+$stmt = $conn->prepare("SELECT COALESCE(SUM(amount), 0) FROM recharge_logs WHERE is_paid = 1");
+if ($stmt === false) {
+    die("准备查询失败: " . $conn->error . "\nSQL: SELECT COALESCE(SUM(amount), 0) FROM recharge_logs WHERE is_paid = 1");
+}
+$stmt->execute();
+$result = $stmt->get_result();
+$row = $result->fetch_row();
+$total_success_amount = $row[0] ?? 0;
+
+// 统计被邀请用户的充值总额
+$stmt = $conn->prepare("SELECT COALESCE(SUM(r.amount), 0) FROM recharge_logs r JOIN users u ON r.user_id = u.id WHERE u.invited_by IS NOT NULL AND r.is_paid = 1");
+if ($stmt === false) {
+    die("准备查询失败: " . $conn->error . "\nSQL: SELECT COALESCE(SUM(r.amount), 0) FROM recharge_logs r JOIN users u ON r.user_id = u.id WHERE u.invited_by IS NOT NULL AND r.is_paid = 1");
+}
+$stmt->execute();
+$result = $stmt->get_result();
+$row = $result->fetch_row();
+$total_invited_recharge_amount = $row[0] ?? 0;
+
+// 统计用户量
+$stmt = $conn->prepare("SELECT COUNT(*) FROM users");
+if ($stmt === false) {
+    die("准备查询失败: " . $conn->error . "\nSQL: SELECT COUNT(*) FROM users");
+}
+$stmt->execute();
+$result = $stmt->get_result();
+$row = $result->fetch_row();
+$total_users = $row[0];
+
+// 统计用户上传图片总量
+$stmt = $conn->prepare("SELECT COUNT(*) FROM uploaded_images");
+if ($stmt === false) {
+    die("准备查询失败: " . $conn->error . "\nSQL: SELECT COUNT(*) FROM uploaded_images");
+}
+$stmt->execute();
+$result = $stmt->get_result();
+$row = $result->fetch_row();
+$total_uploaded_images = $row[0];
+
+// 统计ComfyUI服务器数量
+$stmt = $conn->prepare("SELECT COUNT(*) FROM comfyui_servers");
+if ($stmt === false) {
+    die("准备查询失败: " . $conn->error . "\nSQL: SELECT COUNT(*) FROM comfyui_servers");
+}
+$stmt->execute();
+$result = $stmt->get_result();
+$row = $result->fetch_row();
+$total_comfyui_servers = $row[0];
+
+// 获取最近的充值记录
+$stmt = $conn->prepare("
+    SELECT r.*, u.username 
+    FROM recharge_logs r 
+    JOIN users u ON r.user_id = u.id 
+    ORDER BY r.created_at DESC 
+    LIMIT 10
+");
+if ($stmt === false) {
+    die("准备查询失败: " . $conn->error . "\nSQL: SELECT r.*, u.username FROM recharge_logs r JOIN users u ON r.user_id = u.id ORDER BY r.created_at DESC LIMIT 10");
+}
+$stmt->execute();
+$recent_recharges = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+
+// 获取最近的用户上传记录
+$stmt = $conn->prepare("
+    SELECT ui.*, u.username 
+    FROM uploaded_images ui 
+    JOIN users u ON ui.user_id = u.id 
+    ORDER BY ui.id DESC 
+    LIMIT 10
+");
+if ($stmt === false) {
+    die("准备查询失败: " . $conn->error . "\nSQL: SELECT ui.*, u.username FROM uploaded_images ui JOIN users u ON ui.user_id = u.id ORDER BY ui.id DESC LIMIT 10");
+}
+$stmt->execute();
+$recent_uploads = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+
+// 获取ComfyUI服务器列表
+$stmt = $conn->prepare("SELECT * FROM comfyui_servers ORDER BY id DESC");
+if ($stmt === false) {
+    die("准备查询失败: " . $conn->error . "\nSQL: SELECT * FROM comfyui_servers ORDER BY id DESC");
+}
+$stmt->execute();
+$comfyui_servers = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+
+// 获取当前的扣费金额
+$upload_fee = UPLOAD_FEE;
+
+
+
+// 处理用户选择并保存到数据库
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (isset($_POST['promotion_ratio'])) {
+        $new_promotion_ratio = floatval($_POST['promotion_ratio']);
+        $stmt = $conn->prepare("UPDATE settings SET promotion_ratio = ?");
+        if ($stmt === false) {
+            die("准备查询失败: ". $conn->error. "\nSQL: UPDATE settings SET promotion_ratio = ?");
+        }
+        $stmt->bind_param("d", $new_promotion_ratio);
+        if ($stmt->execute() === false) {
+            die("执行查询失败: ". $stmt->error. "\nSQL: UPDATE settings SET promotion_ratio = ?");
+        }
+    }
+    header('Location: index.php');
+    exit;
+}
+
+
+
+
+
+
+?>
+
+<!DOCTYPE html>
+<html lang="zh-CN">
 <head>
-    <title>图片转文字系统</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>后台管理系统</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        /* 统一页面样式，增强一致性 */
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-        }
         .nav-link { color: #333; }
         .nav-link:hover { color: #007bff; }
         .card { margin-bottom: 20px; }
@@ -110,317 +186,208 @@ if ($is_logged_in) {
             border-radius: 5px;
             text-align: center;
         }
-        .stat-number-size: 2 {
-            font4px;
+        .stat-number {
+            font-size: 24px;
             font-weight: bold;
             color: #007bff;
         }
     </style>
-        .dashboard-card {
-            background: white;
-            border-radius: 10px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            padding: 20px;
-            margin-bottom: 20px;
-        }
-        .invite-link {
-            background: #f8f9fa;
-            padding: 10px;
-            border-radius: 5px;
-            word-break: break-all;
-        }
-        .copy-btn {
-            cursor: pointer;
-            color: #007bff;
-        }
-        .copy-btn:hover {
-            color: #0056b3;
-        }
-    </style>
 </head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container">
+            <a class="navbar-brand" href="#">后台管理系统</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav">
+                    <li class="nav-item">
+                        <a class="nav-link" href="index.php">首页</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="users.php">用户管理</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="comfyui_servers.php">ComfyUI服务器</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="comfyui_statistics.php">使用统计</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="recharge_logs.php">充值记录</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="upload_logs.php">上传记录</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="logout.php">退出登录</a>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
 
-<body class="bg-light">
-    <div class="container py-4">
-        <?php if ($is_logged_in): ?>
-            <div class="row">
-                <!-- 用户信息卡片 -->
-                <div class="col-md-4">
-                    <div class="card mb-4">
-                        <div class="card-body">
-                            <h5 class="card-title">账户信息</h5>
-                            <p class="mb-1">用户名：<?php echo htmlspecialchars($username); ?></p>
-                            <p class="mb-1">邮箱：<?php echo htmlspecialchars($email); ?></p>
-                            <p class="mb-3">余额：<?php echo number_format($balance, 2); ?> 元</p>
-                            <div class="d-grid gap-2">
-                                <a href="upload.php" class="btn btn-primary">上传图片识别</a>
-                                <a href="recharge.php" class="btn btn-primary">充值</a>
-                                <a href="profile.php" class="btn btn-outline-primary">修改资料</a>
-                                <a href="logout.php" class="btn btn-danger">退出登录</a>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 分站信息卡片 -->
-                <div class="col-md-4">
-                    <div class="card mb-4">
-                        <div class="card-body">
-                            <h5 class="card-title">分站信息</h5>
-                            <?php if ($sub_site): ?>
-                                <p class="mb-1">域名：<?php echo htmlspecialchars($sub_site['domain']); ?></p>
-                                <p class="mb-1">到期时间：<?php echo date('Y-m-d H:i:s', strtotime($sub_site['expire_time'])); ?></p>
-                                <p class="mb-3">状态：<?php echo $sub_site['status'] ? '正常' : '已过期'; ?></p>
-                                <div class="d-grid gap-2">
-                                    <a href="https://<?php echo htmlspecialchars($sub_site['domain']); ?>" class="btn btn-primary" target="_blank">管理网站</a>
-                                    <a href="sub_site_renew.php" class="btn btn-primary">续费</a>
-                                    <a href="sub_site_orders.php" class="btn btn-outline-primary">订单记录</a>
-                                </div>
-                            <?php else: ?>
-                                <p class="mb-3">您还没有开通分站</p>
-                                <div class="d-grid">
-                                    <a href="sub_site_create.php" class="btn btn-primary">开通分站</a>
-                                </div>
-                            <?php endif; ?>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 推广信息卡片 -->
-                <div class="col-md-4">
-                    <div class="card mb-4">
-                        <div class="card-body">
-                            <h5 class="card-title">推广信息</h5>
-                            <p class="mb-1">总邀请人数：<?php echo $total_invites; ?></p>
-                            <p class="mb-3">推广链接：<?php echo htmlspecialchars($promote_url); ?></p>
-                            <button class="btn btn-outline-primary" onclick="copyPromoteUrl()">复制链接</button>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 邀请用户列表 -->
-                <div class="col-md-4">
-                    <div class="card mb-4">
-                        <div class="card-body">
-                            <h5 class="card-title">邀请的用户</h5>
-                            <div class="list-group">
-                                <?php foreach ($invited_users as $user): ?>
-                                    <div class="list-group-item">
-                                        <div class="d-flex justify-content-between align-items-center">
-                                            <div>
-                                                <strong><?php echo htmlspecialchars($user['username']); ?></strong>
-                                                <small class="text-muted d-block">注册时间：<?php echo date('Y-m-d H:i', strtotime($user['created_at'])); ?></small>
-                                            </div>
-                                            <span class="badge bg-primary">消费：<?php echo number_format($user['total_recharge'], 2); ?> 元</span>
-                                        </div>
-                                    </div>
-                                <?php endforeach; ?>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- 最近记录卡片 -->
-                <div class="col-md-4">
-                    <div class="card mb-4">
-                        <div class="card-body">
-                            <h5 class="card-title">最近记录</h5>
-                            <div class="list-group">
-                                <?php foreach ($recent_uploads as $upload): ?>
-                                    <div class="list-group-item">
-                                        <small class="text-muted"><?php echo date('Y-m-d H:i', strtotime($upload['created_at'])); ?></small>
-                                        <div>上传图片</div>
-                                    </div>
-                                <?php endforeach; ?>
-                                <?php foreach ($recent_recharges as $recharge): ?>
-                                    <div class="list-group-item">
-                                        <small class="text-muted"><?php echo date('Y-m-d H:i', strtotime($recharge['created_at'])); ?></small>
-                                        <div>充值 <?php echo number_format($recharge['amount'], 2); ?> 元</div>
-                                    </div>
-                                <?php endforeach; ?>
-                            </div>
-                        </div>
-                    </div>
+    <div class="container mt-4">
+        <!-- 统计概览 -->
+        <div class="row">
+            <div class="col-md-3">
+                <div class="stat-box">
+                    <h5>总充值金额</h5>
+                    <p class="stat-number"><?php echo number_format($total_success_amount, 2); ?> 元</p>
                 </div>
             </div>
-        <?php else: ?>
-            <div class="text-center">
-                <h1 class="mb-4">图片转文字系统</h1>
-                <div class="d-grid gap-3 col-md-6 mx-auto">
-                    <a href="register.php" class="btn btn-primary btn-lg">注册</a>
-                    <a href="login.php" class="btn btn-outline-primary btn-lg">登录</a>
+            <div class="col-md-3">
+                <div class="stat-box">
+                    <h5>用户总数</h5>
+                    <p class="stat-number"><?php echo $total_users; ?></p>
                 </div>
             </div>
-        <?php endif; ?>
+            <div class="col-md-3">
+                <div class="stat-box">
+                    <h5>上传图片总数</h5>
+                    <p class="stat-number"><?php echo $total_uploaded_images; ?></p>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="stat-box">
+                    <h5>ComfyUI服务器</h5>
+                    <p class="stat-number"><?php echo $total_comfyui_servers; ?></p>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="stat-box">
+                    <h5>被邀请用户充值总额</h5>
+                    <p class="stat-number"><?php echo number_format($total_invited_recharge_amount, 2); ?> 元</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- 系统设置 -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title mb-0">系统设置</h5>
+            </div>
+            <div class="card-body">
+                <form method="post">
+                    <div class="mb-3">
+                        <label for="upload_fee" class="form-label">每次扣费金额（元）</label>
+                        <input type="number" class="form-control" id="upload_fee" name="upload_fee" 
+                               step="0.01" value="<?php echo $upload_fee; ?>" style="width: 200px;">
+                    </div>
+                    <div class="mb-3">
+                        <label for="promotion_ratio" class="form-label">推广比例</label>
+                        <select class="form-control" id="promotion_ratio" name="promotion_ratio" style="width: 200px;">
+                            <option value="0.1" <?php echo $promotion_ratio == 0.1 ? 'selected' : ''; ?>>10%</option>
+                            <option value="0.2" <?php echo $promotion_ratio == 0.2 ? 'selected' : ''; ?>>20%</option>
+                            <option value="0.3" <?php echo $promotion_ratio == 0.3 ? 'selected' : ''; ?>>30%</option>
+                        </select>
+                    </div>
+                    <button type="submit" class="btn btn-primary">保存设置</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- 最近充值记录 -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title mb-0">最近充值记录</h5>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>用户</th>
+                                <th>金额</th>
+                                <th>状态</th>
+                                <th>时间</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($recent_recharges as $recharge): ?>
+                            <tr>
+                                <td><?php echo htmlspecialchars($recharge['username']); ?></td>
+                                <td><?php echo number_format($recharge['amount'], 2); ?> 元</td>
+                                <td><?php echo $recharge['is_paid'] ? '成功' : '待支付'; ?></td>
+                                <td><?php echo date('Y-m-d H:i:s', strtotime($recharge['created_at'])); ?></td>
+                            </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- 最近上传记录 -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title mb-0">最近上传记录</h5>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>用户</th>
+                                <th>图片路径</th>
+                                <th>时间</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($recent_uploads as $upload): ?>
+                            <tr>
+                                <td><?php echo htmlspecialchars($upload['username']); ?></td>
+                                <td><?php echo htmlspecialchars($upload['image_path']); ?></td>
+                                <td><?php echo date('Y-m-d H:i:s', strtotime($upload['created_at'])); ?></td>
+                            </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ComfyUI服务器列表 -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="card-title mb-0">ComfyUI服务器列表</h5>
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>名称</th>
+                                <th>地址</th>
+                                <th>状态</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($comfyui_servers as $server): ?>
+                            <tr>
+                                <td><?php echo $server['id']; ?></td>
+                                <td><?php echo htmlspecialchars($server['name']); ?></td>
+                                <td><?php echo htmlspecialchars($server['url']); ?></td>
+                                <td><?php echo $server['status'] ? '启用' : '禁用'; ?></td>
+                                <td>
+                                    <a href="comfyui_servers.php?action=edit&id=<?php echo $server['id']; ?>" 
+                                       class="btn btn-sm btn-info">编辑</a>
+                                    <a href="comfyui_servers.php?action=delete&id=<?php echo $server['id']; ?>" 
+                                       class="btn btn-sm btn-danger" 
+                                       onclick="return confirm('确定要删除这个服务器吗？')">删除</a>
+                                </td>
+                            </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
-    <script>
-        function copyPromoteUrl() {
-            const url = '<?php echo $promote_url; ?>';
-            navigator.clipboard.writeText(url).then(() => {
-                alert('推广链接已复制到剪贴板');
-            }).catch(err => {
-                console.error('复制失败:', err);
-                alert('复制失败，请手动复制');
-            });
-        }
-    </script>
 </body>
-
 </html>
-
-<!-- 修改密码功能 -->
-<div class="col-md-4">
-    <div class="card mb-4">
-        <div class="card-body">
-            <h5 class="card-title">修改密码</h5>
-            <?php if (isset($error)): ?>
-                <p class="error"><?php echo $error; ?></p>
-            <?php endif; ?>
-            <?php if (isset($success)): ?>
-                <p class="success"><?php echo $success; ?></p>
-            <?php endif; ?>
-            <form method="post">
-                <label for="old_password">旧密码：</label><br>
-                <input type="password" id="old_password" name="old_password" required><br>
-                <label for="new_password">新密码：</label><br>
-                <input type="password" id="new_password" name="new_password" required><br>
-                <label for="confirm_password">确认密码：</label><br>
-                <input type="password" id="confirm_password" name="confirm_password" required><br>
-                <input type="submit" value="修改密码">
-            </form>
-        </div>
-    </div>
-</div>
-
-<!-- ComfyUI服务器管理功能 -->
-<div class="col-md-4">
-    <div class="card mb-4">
-        <div class="card-body">
-            <h5 class="card-title">ComfyUI服务器管理</h5>
-            <div class="table-responsive">
-                <table class="table">
-                    <thead>
-                        <tr>
-                            <th>ID</th>
-                            <th>名称</th>
-                            <th>地址</th>
-                            <th>状态</th>
-                            <th>操作</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php foreach ($servers as $s): ?>
-                        <tr>
-                            <td><?php echo $s['id']; ?></td>
-                            <td><?php echo htmlspecialchars($s['name']); ?></td>
-                            <td><?php echo htmlspecialchars($s['url']); ?></td>
-                            <td><?php echo $s['status'] ? '启用' : '禁用'; ?></td>
-                            <td>
-                                <a href="?action=edit&id=<?php echo $s['id']; ?>" class="btn btn-sm btn-info">编辑</a>
-                                <a href="?action=delete&id=<?php echo $s['id']; ?>" class="btn btn-sm btn-danger" onclick="return confirm('确定要删除这个服务器吗？')">删除</a>
-                            </td>
-                        </tr>
-                        <?php endforeach; ?>
-                    </tbody>
-                </table>
-            </div>
-            <div class="card">
-                <div class="card-header">
-                    <h5 class="card-title mb-0"><?php echo $server ? '编辑服务器' : '添加服务器'; ?></h5>
-                </div>
-                <div class="card-body">
-                    <?php if (isset($error)): ?>
-                        <div class="alert alert-danger"><?php echo $error; ?></div>
-                    <?php endif; ?>
-                    <form method="post">
-                        <?php if ($server): ?>
-                            <input type="hidden" name="id" value="<?php echo $server['id']; ?>">
-                        <?php endif; ?>
-                        <div class="mb-3">
-                            <label for="name" class="form-label">服务器名称</label>
-                            <input type="text" class="form-control" id="name" name="name" value="<?php echo $server ? htmlspecialchars($server['name']) : ''; ?>" required>
-                        </div>
-                        <div class="mb-3">
-                            <label for="url" class="form-label">服务器地址</label>
-                            <input type="url" class="form-control" id="url" name="url" value="<?php echo $server ? htmlspecialchars($server['url']) : ''; ?>" required>
-                        </div>
-                        <div class="mb-3">
-                            <label for="api_key" class="form-label">API密钥（可选）</label>
-                            <input type="text" class="form-control" id="api_key" name="api_key" value="<?php echo $server ? htmlspecialchars($server['api_key']) : ''; ?>">
-                        </div>
-                        <div class="mb-3 form-check">
-                            <input type="checkbox" class="form-check-input" id="status" name="status" <?php echo $server && $server['status'] ? 'checked' : ''; ?>>
-                            <label class="form-check-label" for="status">启用服务器</label>
-                        </div>
-                        <button type="submit" class="btn btn-primary">保存</button>
-                        <?php if ($server): ?>
-                            <a href="comfyui_servers.php" class="btn btn-secondary">取消</a>
-                        <?php endif; ?>
-                    </form>
-                </div>
-            </div>
-        </div>
-    </div>
-</div>
-
-<!-- ComfyUI使用统计功能 -->
-<div class="col-md-4">
-    <div class="card mb-4">
-        <div class="card-body">
-            <h5 class="card-title">ComfyUI使用统计</h5>
-            <form method="get" class="row g-3 mb-4">
-                <div class="col-md-4">
-                    <label for="start_date" class="form-label">开始日期</label>
-                    <input type="date" class="form-control" id="start_date" name="start_date" value="<?php echo $start_date; ?>">
-                </div>
-                <div class="col-md-4">
-                    <label for="end_date" class="form-label">结束日期</label>
-                    <input type="date" class="form-control" id="end_date" name="end_date" value="<?php echo $end_date; ?>">
-                </div>
-                <div class="col-md-4">
-                    <label class="form-label">&nbsp;</label>
-                    <button type="submit" class="btn btn-primary d-block">查询</button>
-                </div>
-            </form>
-            <div class="table-responsive">
-                <table class="table">
-                    <thead>
-                        <tr>
-                            <th>服务器名称</th>
-                            <th>总用户数</th>
-                            <th>总生成量</th>
-                            <th>最后更新</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php foreach ($stats as $stat): ?>
-                        <tr>
-                            <td><?php echo htmlspecialchars($stat['name']); ?></td>
-                            <td><?php echo $stat['total_users'] ?? 0; ?></td>
-                            <td><?php echo $stat['total_generations'] ?? 0; ?></td>
-                            <td><?php echo $stat['last_update'] ?? '-'; ?></td>
-                        </tr>
-                        <?php endforeach; ?>
-                    </tbody>
-                </table>
-            </div>
-            <div class="mt-4">
-                <canvas id="dailyStatsChart"></canvas>
-            </div>
-        </div>
-    </div>
-</div>
-
-<!-- ComfyUI工作流API管理功能 -->
-<div class="col-md-4">
-    <div class="card mb-4">
-        <div class="card-body">
-            <h5 class="card-title">ComfyUI工作流API管理</h5>
-            <h2>添加ComfyUI工作流API</h2>
-            <form method="post">
-                <div class="mb-3">
-                    <label for="name" class="form-label">名称</label>
-                    <input type="text" class="form-control" id="name" name="name" required>
-                </div>
-                <div class="mb-
